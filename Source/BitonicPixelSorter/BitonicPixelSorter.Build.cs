@@ -21,6 +21,7 @@ public class BitonicPixelSorter : ModuleRules
 		{
 			"RenderCore", // RDG (FRDGBuilder), AddShaderSourceDirectoryMapping
 			"RHI",
+			"Renderer",   // ScreenPass, PostProcessMaterialInputs (SceneViewExtension post-process hook)
 			"Projects",   // IPluginManager (shader directory mapping)
 		});
 	}

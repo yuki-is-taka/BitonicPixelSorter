@@ -2,6 +2,7 @@
 
 #include "Modules/ModuleManager.h"
 #include "Misc/Paths.h"
+#include "Misc/CoreDelegates.h"
 #include "ShaderCore.h"
 #include "Interfaces/IPluginManager.h"
 #include "SceneViewExtension.h"
@@ -9,10 +10,11 @@
 
 /**
  * Module for the Bitonic Pixel Sorter plugin.
- * - Maps the plugin's Shaders directory to the virtual path /Plugin/BitonicPixelSorter.
- * - Registers a SceneViewExtension that will host the post-process compute passes.
- *   The extension is inert in this skeleton (IsActiveThisFrame_Internal returns false)
- *   until the bitonic-sort port is implemented.
+ * - Maps the plugin's Shaders directory to /Plugin/BitonicPixelSorter (must happen early, before
+ *   global shaders are initialized -> done in StartupModule at LoadingPhase PostConfigInit).
+ * - Registers the SceneViewExtension that hosts the post-process compute passes. This is deferred
+ *   to OnPostEngineInit because FSceneViewExtensions::NewExtension requires GEngine, which does not
+ *   exist yet at PostConfigInit.
  */
 class FBitonicPixelSorterModule : public IModuleInterface
 {
@@ -26,15 +28,20 @@ public:
 			AddShaderSourceDirectoryMapping(TEXT("/Plugin/BitonicPixelSorter"), ShaderDir);
 		}
 
-		ViewExtension = FSceneViewExtensions::NewExtension<FBitonicPixelSorterSceneViewExtension>();
+		PostEngineInitHandle = FCoreDelegates::OnPostEngineInit.AddLambda([this]()
+		{
+			ViewExtension = FSceneViewExtensions::NewExtension<FBitonicPixelSorterSceneViewExtension>();
+		});
 	}
 
 	virtual void ShutdownModule() override
 	{
+		FCoreDelegates::OnPostEngineInit.Remove(PostEngineInitHandle);
 		ViewExtension.Reset();
 	}
 
 private:
+	FDelegateHandle PostEngineInitHandle;
 	TSharedPtr<FBitonicPixelSorterSceneViewExtension, ESPMode::ThreadSafe> ViewExtension;
 };
 

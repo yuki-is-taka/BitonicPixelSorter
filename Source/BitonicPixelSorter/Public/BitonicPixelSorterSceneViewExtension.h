@@ -5,14 +5,18 @@
 #include "CoreMinimal.h"
 #include "SceneViewExtension.h"
 
+struct FScreenPassTexture;
+struct FPostProcessMaterialInputs;
+
 /**
- * SceneViewExtension that hosts the bitonic pixel-sort post-process compute passes.
+ * SceneViewExtension that runs the bitonic pixel-sort compute passes as a post-process effect.
  *
- * Injection point (planned): SubscribeToPostProcessingPass(EPostProcessingPass::Tonemap, ...),
- * where an FAfterPassCallbackDelegate will run the MetaPass + SortPass RDG compute dispatches
- * on the scene color. Implemented as compute (RDG) so it stays cross-platform (D3D12/Vulkan/Metal).
+ * Controlled by console variables (r.BitonicPixelSorter.*). When r.BitonicPixelSorter.Enable != 0
+ * the extension subscribes to the Tonemap post-processing pass and replaces the scene color with
+ * the sorted result.
  *
- * Skeleton state: inert (IsActiveThisFrame_Internal returns false) until the port lands.
+ * NOTE: the algorithm sorts an entire line in group-shared memory, so it only runs when the sorted
+ * axis is < 2048 px (otherwise the scene color is returned unchanged).
  */
 class FBitonicPixelSorterSceneViewExtension : public FSceneViewExtensionBase
 {
@@ -29,4 +33,11 @@ public:
 
 protected:
 	virtual bool IsActiveThisFrame_Internal(const FSceneViewExtensionContext& Context) const override;
+
+private:
+	/** Post-process pass callback: scene color -> bitonic sort -> result. */
+	FScreenPassTexture PostProcessPass_RenderThread(
+		FRDGBuilder& GraphBuilder,
+		const FSceneView& View,
+		const FPostProcessMaterialInputs& Inputs);
 };
