@@ -2,6 +2,7 @@
 
 #include "BitonicPixelSorterSceneViewExtension.h"
 #include "BitonicPixelSorterRenderer.h"
+#include "BitonicPixelSorterBlendable.h"
 
 #include "PostProcess/PostProcessMaterialInputs.h"
 #include "ScreenPass.h"
@@ -40,6 +41,14 @@ static TAutoConsoleVariable<float> CVarStrength(
 	TEXT("Effect strength 0..1: cross-fade between the original (0) and fully sorted (1) image. <=0 bypasses."),
 	ECVF_RenderThreadSafe);
 
+// Returns the per-view blended sorter settings if a Post Process Volume / camera / component is
+// driving this view, or nullptr to fall back to the CVars.
+static const FBitonicPixelSorterBlendData* FindBlendable(const FSceneView& View)
+{
+	FBlendableEntry* Iterator = nullptr;
+	return View.FinalPostProcessSettings.BlendableManager.IterateBlendables<FBitonicPixelSorterBlendData>(Iterator);
+}
+
 FBitonicPixelSorterSceneViewExtension::FBitonicPixelSorterSceneViewExtension(const FAutoRegister& AutoRegister)
 	: FSceneViewExtensionBase(AutoRegister)
 {
@@ -47,11 +56,10 @@ FBitonicPixelSorterSceneViewExtension::FBitonicPixelSorterSceneViewExtension(con
 
 bool FBitonicPixelSorterSceneViewExtension::IsActiveThisFrame_Internal(const FSceneViewExtensionContext& Context) const
 {
-	// Fully bypass (the SVE reports inactive, so no pass is ever scheduled) when the effect would be a
-	// no-op: disabled, zero strength, or an empty/inverted threshold window.
-	return CVarEnable.GetValueOnAnyThread() != 0
-		&& CVarStrength.GetValueOnAnyThread() > 0.0f
-		&& CVarThresholdMin.GetValueOnAnyThread() < CVarThresholdMax.GetValueOnAnyThread();
+	// Participate every frame; the per-view gating (CVar fallback, or a Post Process Volume blendable
+	// which is only visible from the view's FinalPostProcessSettings) happens in
+	// SubscribeToPostProcessingPass. No pass -- hence no GPU work -- is scheduled unless it adds one.
+	return true;
 }
 
 void FBitonicPixelSorterSceneViewExtension::SubscribeToPostProcessingPass(
@@ -60,14 +68,30 @@ void FBitonicPixelSorterSceneViewExtension::SubscribeToPostProcessingPass(
 	FPostProcessingPassDelegateArray& InOutPassCallbacks,
 	bool bIsPassEnabled)
 {
-	// Same bypass as IsActiveThisFrame_Internal: only subscribe the callback when the effect will
-	// actually do something. Zero strength or an empty threshold window means no pass at all.
-	const bool bEffectActive =
-		CVarEnable.GetValueOnRenderThread() != 0
-		&& CVarStrength.GetValueOnRenderThread() > 0.0f
-		&& CVarThresholdMin.GetValueOnRenderThread() < CVarThresholdMax.GetValueOnRenderThread();
+	if (Pass != EPostProcessingPass::Tonemap)
+	{
+		return;
+	}
 
-	if (Pass == EPostProcessingPass::Tonemap && bEffectActive)
+	// A Post Process Volume / camera / component blendable drives this view if present; otherwise the
+	// global CVars do. Either way, only subscribe when the effect will actually do something --
+	// zero strength or an empty threshold window means no pass at all (a true bypass).
+	const FBitonicPixelSorterBlendData* Blend = FindBlendable(InView);
+
+	bool bEffectActive;
+	if (Blend != nullptr)
+	{
+		bEffectActive = Blend->Strength > 0.0f && Blend->ThresholdMin < Blend->ThresholdMax;
+	}
+	else
+	{
+		bEffectActive =
+			CVarEnable.GetValueOnRenderThread() != 0
+			&& CVarStrength.GetValueOnRenderThread() > 0.0f
+			&& CVarThresholdMin.GetValueOnRenderThread() < CVarThresholdMax.GetValueOnRenderThread();
+	}
+
+	if (bEffectActive)
 	{
 		InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(
 			this, &FBitonicPixelSorterSceneViewExtension::PostProcessPass_RenderThread));
@@ -89,11 +113,22 @@ FScreenPassTexture FBitonicPixelSorterSceneViewExtension::PostProcessPass_Render
 	}
 
 	FBitonicPixelSorterParams Params;
-	Params.Angle = CVarAngle.GetValueOnRenderThread();
-	Params.bAscending  = CVarAscending.GetValueOnRenderThread() != 0;
-	Params.ThresholdMin = CVarThresholdMin.GetValueOnRenderThread();
-	Params.ThresholdMax = CVarThresholdMax.GetValueOnRenderThread();
-	Params.Strength = CVarStrength.GetValueOnRenderThread();
+	if (const FBitonicPixelSorterBlendData* Blend = FindBlendable(View))
+	{
+		Params.Angle = Blend->Angle;
+		Params.bAscending = Blend->bAscending != 0;
+		Params.ThresholdMin = Blend->ThresholdMin;
+		Params.ThresholdMax = Blend->ThresholdMax;
+		Params.Strength = Blend->Strength;
+	}
+	else
+	{
+		Params.Angle = CVarAngle.GetValueOnRenderThread();
+		Params.bAscending = CVarAscending.GetValueOnRenderThread() != 0;
+		Params.ThresholdMin = CVarThresholdMin.GetValueOnRenderThread();
+		Params.ThresholdMax = CVarThresholdMax.GetValueOnRenderThread();
+		Params.Strength = CVarStrength.GetValueOnRenderThread();
+	}
 
 	FRDGTextureRef Sorted = AddBitonicPixelSortPasses(
 		GraphBuilder, View.GetFeatureLevel(), SceneColor.Texture, SceneColor.ViewRect, Params);
