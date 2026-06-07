@@ -15,9 +15,9 @@ static TAutoConsoleVariable<int32> CVarEnable(
 	TEXT("Enable the bitonic pixel-sort post-process effect (0=off, 1=on)."),
 	ECVF_RenderThreadSafe);
 
-static TAutoConsoleVariable<int32> CVarHorizontal(
-	TEXT("r.BitonicPixelSorter.Horizontal"), 1,
-	TEXT("Sort direction: 1=horizontal (rows), 0=vertical (columns)."),
+static TAutoConsoleVariable<float> CVarAngle(
+	TEXT("r.BitonicPixelSorter.Angle"), 0.0f,
+	TEXT("Sort line angle in degrees [0,180). 0=horizontal rows, 90=vertical columns, 45=diagonal."),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarAscending(
@@ -73,7 +73,7 @@ FScreenPassTexture FBitonicPixelSorterSceneViewExtension::PostProcessPass_Render
 	}
 
 	FBitonicPixelSorterParams Params;
-	Params.bHorizontal = CVarHorizontal.GetValueOnRenderThread() != 0;
+	Params.Angle = CVarAngle.GetValueOnRenderThread();
 	Params.bAscending  = CVarAscending.GetValueOnRenderThread() != 0;
 	Params.ThresholdMin = CVarThresholdMin.GetValueOnRenderThread();
 	Params.ThresholdMax = CVarThresholdMax.GetValueOnRenderThread();

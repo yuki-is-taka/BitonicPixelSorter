@@ -1,11 +1,17 @@
 // BitonicPixelSorter.usf
 // Unreal Engine port of ruccho/BitonicPixelSorter (MIT, Copyright (c) 2020 ruccho).
 //
-// Faithful port of BitonicPixelSorter.compute. Differences vs the original:
-//   - Unity "#pragma kernel" / debug pragmas removed (entry points are wired in C++ via IMPLEMENT_GLOBAL_SHADER).
-//   - `min16int` -> `int` (min16int is not used anywhere in UE's shaders; avoided for cross-platform/Metal safety).
-//   - `bool` shader params arrive as uint (direction / ordering) from the C++ parameter struct.
-//   - Added the UE Platform.ush include.
+// Faithful port of BitonicPixelSorter.compute, generalized to arbitrary-angle sort lines.
+// Differences vs the original:
+//   - Unity "#pragma kernel" / debug pragmas removed (entry points wired in C++ via IMPLEMENT_GLOBAL_SHADER).
+//   - `min16int` -> `int` (avoided for cross-platform/Metal safety).
+//   - `bool` shader params arrive as uint (direction / ordering).
+//   - Confined to ViewRect via viewportMin / viewportSize.
+//   - Arbitrary angle: instead of axis-aligned rows/columns, each "line" is a sheared digital line
+//     pixel = (coord, round(L + coord*slope)) (x-major) at angle theta. Because round(n + f) == n +
+//     round(f) for integer n, the forward map is an exact tiling of the grid -> the result is an
+//     exact permutation of in-view pixels (no resampling/blur). slope == 0 reproduces the original
+//     axis-aligned rows/columns bit-for-bit. See lineTexel().
 // Loose parameter names must match the C++ SHADER_PARAMETER_STRUCTs (FMetaPassCS / FSortPassCS).
 
 #include "/Engine/Public/Platform.ush"
@@ -50,16 +56,33 @@ void unpackMetaGroupCache(uint packed, out bool left, out bool right, out int va
     brightnessB = (packed & 0x000000FF);
 }
 
-// ============================ MetaPass ============================
-// Parameters match FMetaPassCS::FParameters.
+// ============================ shared parameters ============================
+// Match FMetaPassCS::FParameters / FSortPassCS::FParameters.
 Texture2D<float4> srcTex;
 RWTexture2D<uint2> metaTex;
 float thresholdMin;
 float thresholdMax;
-uint direction; // bool: horizontal(1) sorts rows, vertical(0) sorts columns
-uint2 viewportMin;  // ViewRect.Min: texel offset of the view inside the (often padded) texture
-uint2 viewportSize; // ViewRect size: process only this region (texels outside are uninitialized)
+uint direction;      // 1 = x-major (lines run along X, ~horizontal), 0 = y-major (along Y, ~vertical)
+uint2 viewportMin;   // ViewRect.Min: texel offset of the view inside the (often padded) texture
+uint2 viewportSize;  // ViewRect size: process only this region (texels outside are uninitialized)
+float slope;         // minor-axis step per major-axis step (tan or cot, in [-1,1]); 0 = axis-aligned
+int lineOffset;      // line intercept of lineIdx 0 (L = lineIdx + lineOffset)
 
+// Map (line index, position along the major axis) to a texel in the view.
+//   minor = round((lineIdx + lineOffset) + coord*slope)
+// bInside is false when the texel leaves the view along the minor axis (those positions are skipped:
+// not range-tested and not written), keeping the operation an exact permutation of in-view pixels.
+// slope == 0 collapses to the original axis-aligned mapping (coord, lineIdx) / (lineIdx, coord).
+uint2 lineTexel(int lineIdx, int coord, out bool bInside)
+{
+    int minorDim = direction ? (int)viewportSize.y : (int)viewportSize.x;
+    int minor = (int)round((float)(lineIdx + lineOffset) + (float)coord * slope);
+    bInside = (minor >= 0) && (minor < minorDim);
+    int minorC = clamp(minor, 0, minorDim - 1); // keep the texel read in-bounds even when skipped
+    return direction ? uint2((uint)coord, (uint)minorC) : uint2((uint)minorC, (uint)coord);
+}
+
+// ============================ MetaPass ============================
 groupshared uint metaGroupCache[MAX_SIZE * 4];
 
 [numthreads(META_THREADS_PER_GROUP,1,1)]
@@ -69,11 +92,15 @@ void MetaPass(uint3 groupId : SV_GroupID,
     uint width = viewportSize.x;
     uint height = viewportSize.y;
 
-    uint size = direction ? width : height;
+    uint size = direction ? width : height; // line length along the major axis
     uint id = groupId.x * META_THREADS_PER_GROUP + gtid.x;
     bool metaDirection = id % 2 == 0; // RTL for even thread, LTR for odd thread
-    uint y = id / 2; // two threads per row
+    uint y = id / 2; // line index (two threads per line)
     uint groupLocalY = gtid.x / 2;
+
+    // NOTE: do not early-out excess threads (y >= numLines) here -- the group barrier below must be
+    // reached by every thread. Excess threads harmlessly process an all-out-of-view line; their
+    // metaTex writes land out of bounds (row >= numLines) and are dropped.
 
     int rangeStart = metaDirection ? size : -1;
     uint halfSize = round(size / 8) * 4;
@@ -92,19 +119,15 @@ void MetaPass(uint3 groupId : SV_GroupID,
             uint xFirst = metaDirection ? xL : xR;
             uint xSecond = metaDirection ? xR : xL;
 
-            uint2 posFirst;
-            posFirst.x = direction ? xFirst : y;
-            posFirst.y = direction ? y : xFirst;
-
-            uint2 posSecond;
-            posSecond.x = direction ? xSecond : y;
-            posSecond.y = direction ? y : xSecond;
+            bool inFirst, inSecond;
+            uint2 posFirst = lineTexel((int)y, (int)xFirst, inFirst);
+            uint2 posSecond = lineTexel((int)y, (int)xSecond, inSecond);
 
             float bFirst = brightness(srcTex[posFirst + viewportMin]);
-            bool rangeFirst = xFirst < size && thresholdMin <= bFirst && bFirst <= thresholdMax;
+            bool rangeFirst = xFirst < size && inFirst && thresholdMin <= bFirst && bFirst <= thresholdMax;
 
             float bSecond = brightness(srcTex[posSecond + viewportMin]);
-            bool rangeSecond = thresholdMin <= bSecond && bSecond <= thresholdMax;
+            bool rangeSecond = inSecond && thresholdMin <= bSecond && bSecond <= thresholdMax;
 
             int rangeStartFirst = metaDirection
                                       ? (rangeFirst ? min(rangeStart, (int)xFirst) : size)
@@ -169,19 +192,15 @@ void MetaPass(uint3 groupId : SV_GroupID,
             float startL = metaDirection ? rangeStartAny : otherStart;
             float startR = metaDirection ? otherStart : rangeStartAny;
 
-            uint2 pos;
-            pos.x = direction ? xMeta : y;
-            pos.y = direction ? y : xMeta;
-
+            // metaTex is our own intermediate, keyed by (position/2 along the line, line index).
             // B8L12R12
-            metaTex[pos] = uint2(((uint)startL & 0x0FFF) << 12 | (uint)startR & 0x0FFF,
-                                 ((f32tof16(bFirst) & 0xFFFF) << 16) | (f32tof16(bSecond) & 0xFFFF));
+            metaTex[uint2(xMeta, y)] = uint2(((uint)startL & 0x0FFF) << 12 | (uint)startR & 0x0FFF,
+                                             ((f32tof16(bFirst) & 0xFFFF) << 16) | (f32tof16(bSecond) & 0xFFFF));
         }
     }
 }
 
 // ============================ SortPass ============================
-// Parameters match FSortPassCS::FParameters (srcTex / direction shared with MetaPass above).
 Texture2D<uint2> srcMetaTex;
 RWTexture2D<float4> sortTex;
 int maxLevels;
@@ -193,7 +212,7 @@ groupshared uint groupCache[MAX_SIZE];
 void SortPass(uint3 gid_l : SV_GroupID,
               uint3 gtid_l : SV_GroupThreadID)
 {
-    int gid = gid_l.x;
+    int gid = gid_l.x; // line index
     int gtid = gtid_l.x;
     int ops;
     uint size;
@@ -201,7 +220,7 @@ void SortPass(uint3 gid_l : SV_GroupID,
         uint width = viewportSize.x;
         uint height = viewportSize.y;
 
-        size = direction ? width : height;
+        size = direction ? width : height; // line length along the major axis
         uint reducedSize = ceil((float)size / 2);
 
         ops = ceil((float)reducedSize / MAX_THREADS);
@@ -213,19 +232,12 @@ void SortPass(uint3 gid_l : SV_GroupID,
         for (int t = 0; t < ops; t++)
         {
             int xMeta = (MAX_THREADS * t + gtid);
-            int y = gid;
 
             int xL = xMeta * 2;
             int xR = xL + 1;
 
-            uint2 id = uint2(xMeta, y);
-
-            uint2 pos;
-            pos.x = direction ? id.x : id.y;
-            pos.y = direction ? id.y : id.x;
-
-            //get meta
-            uint2 meta = srcMetaTex[pos];
+            //get meta (keyed by position/2 along the line, line index)
+            uint2 meta = srcMetaTex[uint2(xMeta, gid)];
             uint meta0 = meta.x;
             int startL = (meta0 >> 12) & 0x0FFF;
             int startR = meta0 & 0x0FFF;
@@ -297,38 +309,34 @@ void SortPass(uint3 gid_l : SV_GroupID,
     for (int t = 0; t < ops; t++)
     {
         int xMeta = (MAX_THREADS * t + gtid);
-        int y = gid;
 
         int xL = xMeta * 2;
         int xR = xL + 1;
 
-        uint2 pos_a;
-        pos_a.x = direction ? xL : y;
-        pos_a.y = direction ? y : xL;
-
-        uint2 pos_b;
-        pos_b.x = direction ? xR : y;
-        pos_b.y = direction ? y : xR;
-
         uint val_a = groupCache[xL];
         uint val_b = groupCache[xR];
 
-        // Clamp gather indices into the valid axis range [0, size). A stale/garbage index from an
-        // uninitialized groupCache slot can appear at the edge of a sort range; the resulting
-        // out-of-bounds srcTex read shows up as a magenta speckle along the boundary. Clamping
-        // keeps the read in-bounds (worst case: it samples the edge pixel instead of garbage).
+        // Clamp gather indices into the valid line range [0, size). A stale index from an
+        // uninitialized groupCache slot can appear at a sort-range edge; clamping keeps the read
+        // in-bounds (worst case it samples the line's edge pixel instead of garbage).
         uint idx_left = min(val_a >> 16, size - 1);
         uint idx_right = min(val_b >> 16, size - 1);
 
-        uint2 pos_left;
-        pos_left.x = direction ? idx_left : y;
-        pos_left.y = direction ? y : idx_left;
+        bool inA, inB, inL, inR;
+        uint2 pos_a = lineTexel(gid, xL, inA);
+        uint2 pos_b = lineTexel(gid, xR, inB);
+        uint2 pos_left = lineTexel(gid, (int)idx_left, inL);
+        uint2 pos_right = lineTexel(gid, (int)idx_right, inR);
 
-        uint2 pos_right;
-        pos_right.x = direction ? idx_right : y;
-        pos_right.y = direction ? y : idx_right;
-
-        sortTex[pos_a + viewportMin] = srcTex[pos_left + viewportMin];
-        sortTex[pos_b + viewportMin] = srcTex[pos_right + viewportMin];
+        // Only write output texels that are in the major range and inside the view; everything
+        // outside is left as the pristine original (it is never written here).
+        if (inA && xL < (int)size)
+        {
+            sortTex[pos_a + viewportMin] = srcTex[pos_left + viewportMin];
+        }
+        if (inB && xR < (int)size)
+        {
+            sortTex[pos_b + viewportMin] = srcTex[pos_right + viewportMin];
+        }
     }
 }

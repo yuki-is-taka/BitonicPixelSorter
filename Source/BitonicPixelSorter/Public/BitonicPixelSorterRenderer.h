@@ -11,8 +11,8 @@ class FRDGBuilder;
 /** Parameters for one bitonic pixel-sort dispatch. Mirrors the original Unity component's options. */
 struct FBitonicPixelSorterParams
 {
-	/** Sort direction. true = horizontal (sort each row), false = vertical (sort each column). */
-	bool bHorizontal = true;
+	/** Sort line angle in degrees, [0,180). 0 = horizontal rows, 90 = vertical columns, 45 = diagonal. */
+	float Angle = 0.0f;
 
 	/** Sort order. true = ascending by brightness. */
 	bool bAscending = true;

@@ -27,6 +27,8 @@ class FMetaPassCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, direction)
 		SHADER_PARAMETER(FUintVector2, viewportMin)
 		SHADER_PARAMETER(FUintVector2, viewportSize)
+		SHADER_PARAMETER(float, slope)
+		SHADER_PARAMETER(int32, lineOffset)
 	END_SHADER_PARAMETER_STRUCT()
 
 public:
@@ -52,6 +54,8 @@ class FSortPassCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, direction)
 		SHADER_PARAMETER(FUintVector2, viewportMin)
 		SHADER_PARAMETER(FUintVector2, viewportSize)
+		SHADER_PARAMETER(float, slope)
+		SHADER_PARAMETER(int32, lineOffset)
 	END_SHADER_PARAMETER_STRUCT()
 
 public:
@@ -75,19 +79,47 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 	const FUintVector2 ViewMin((uint32)ViewRect.Min.X, (uint32)ViewRect.Min.Y);
 	const uint32 W = (uint32)ViewRect.Width();
 	const uint32 H = (uint32)ViewRect.Height();
-	const uint32 SortAxis = Params.bHorizontal ? W : H;
-	const uint32 Lines    = Params.bHorizontal ? H : W;
+
+	// Resolve the angle into a sheared-line parameterization: the line runs along the major axis
+	// (X when more horizontal, Y when more vertical) and steps the minor axis by Slope (|Slope| <= 1)
+	// each pixel. Slope == 0 reproduces the axis-aligned horizontal/vertical sort exactly.
+	const float Theta = FMath::DegreesToRadians(Params.Angle);
+	const float CosT = FMath::Cos(Theta);
+	const float SinT = FMath::Sin(Theta);
+	const bool bXMajor = FMath::Abs(SinT) <= FMath::Abs(CosT);
+	const uint32 DirectionFlag = bXMajor ? 1u : 0u;
+	const float Slope = bXMajor ? (SinT / CosT) : (CosT / SinT);
+	const uint32 SortAxis = bXMajor ? W : H; // line length along the major axis
+	const uint32 MinorDim = bXMajor ? H : W;
+
+	// A pixel (major, minor) lies on line L = round(minor - major*Slope). Cover every line the view
+	// can touch (its corners) plus a 1-line margin; lines that fall fully outside the view do nothing.
+	int LineMin = MAX_int32;
+	int LineMax = MIN_int32;
+	for (int MajorEnd = 0; MajorEnd <= 1; ++MajorEnd)
+	{
+		for (int MinorEnd = 0; MinorEnd <= 1; ++MinorEnd)
+		{
+			const int Major = MajorEnd ? (int)SortAxis - 1 : 0;
+			const int Minor = MinorEnd ? (int)MinorDim - 1 : 0;
+			const int L = FMath::RoundToInt((float)Minor - (float)Major * Slope);
+			LineMin = FMath::Min(LineMin, L);
+			LineMax = FMath::Max(LineMax, L);
+		}
+	}
+	LineMin -= 1;
+	LineMax += 1;
+	const int32 LineOffset = LineMin;
+	const uint32 NumLines = (uint32)(LineMax - LineMin + 1);
 
 	// Algorithm sorts an entire line in group-shared memory; bail if it can't fit.
-	if (SortAxis == 0 || Lines == 0 || SortAxis >= kMaxSize)
+	if (SortAxis == 0 || NumLines == 0 || SortAxis >= kMaxSize)
 	{
 		return SrcTexture;
 	}
 
-	// metaTex is half-width along the sorted axis (it stores one entry per pixel pair).
-	const FIntPoint MetaExtent(
-		Params.bHorizontal ? W / 2 : W,
-		Params.bHorizontal ? H : H / 2);
+	// metaTex is our own intermediate, keyed by (position/2 along the line, line index).
+	const FIntPoint MetaExtent(FMath::DivideAndRoundUp(SortAxis, 2u), NumLines);
 
 	FRDGTextureRef MetaTexture = GraphBuilder.CreateTexture(
 		FRDGTextureDesc::Create2D(MetaExtent, PF_R32G32_UINT, FClearValueBinding::None,
@@ -100,9 +132,8 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 		TEXT("BitonicPixelSorter.Sorted"));
 
 	FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(FeatureLevel);
-	const uint32 DirectionFlag = Params.bHorizontal ? 1u : 0u;
 
-	// --- MetaPass: ceil(Lines*2 / META_THREADS_PER_GROUP) groups (2 threads per line) ---
+	// --- MetaPass: ceil(NumLines*2 / META_THREADS_PER_GROUP) groups (2 threads per line) ---
 	{
 		FMetaPassCS::FParameters* P = GraphBuilder.AllocParameters<FMetaPassCS::FParameters>();
 		P->srcTex = SrcTexture;
@@ -112,9 +143,11 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 		P->direction = DirectionFlag;
 		P->viewportMin = ViewMin;
 		P->viewportSize = FUintVector2(W, H);
+		P->slope = Slope;
+		P->lineOffset = LineOffset;
 
 		TShaderMapRef<FMetaPassCS> ComputeShader(ShaderMap);
-		const uint32 Groups = FMath::DivideAndRoundUp(Lines * 2, kMetaThreadsPerGroup);
+		const uint32 Groups = FMath::DivideAndRoundUp(NumLines * 2, kMetaThreadsPerGroup);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("BitonicPixelSorter.Meta"),
 			ComputeShader, P, FIntVector(Groups, 1, 1));
 	}
@@ -130,10 +163,12 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 		P->direction = DirectionFlag;
 		P->viewportMin = ViewMin;
 		P->viewportSize = FUintVector2(W, H);
+		P->slope = Slope;
+		P->lineOffset = LineOffset;
 
 		TShaderMapRef<FSortPassCS> ComputeShader(ShaderMap);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("BitonicPixelSorter.Sort"),
-			ComputeShader, P, FIntVector(Lines, 1, 1));
+			ComputeShader, P, FIntVector(NumLines, 1, 1));
 	}
 
 	return SortTexture;
