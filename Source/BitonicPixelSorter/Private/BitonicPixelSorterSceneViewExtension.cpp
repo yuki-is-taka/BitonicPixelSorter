@@ -35,6 +35,11 @@ static TAutoConsoleVariable<float> CVarThresholdMax(
 	TEXT("Only pixels with brightness <= this are sorted."),
 	ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<float> CVarStrength(
+	TEXT("r.BitonicPixelSorter.Strength"), 1.0f,
+	TEXT("Effect strength 0..1: cross-fade between the original (0) and fully sorted (1) image. <=0 bypasses."),
+	ECVF_RenderThreadSafe);
+
 FBitonicPixelSorterSceneViewExtension::FBitonicPixelSorterSceneViewExtension(const FAutoRegister& AutoRegister)
 	: FSceneViewExtensionBase(AutoRegister)
 {
@@ -42,7 +47,11 @@ FBitonicPixelSorterSceneViewExtension::FBitonicPixelSorterSceneViewExtension(con
 
 bool FBitonicPixelSorterSceneViewExtension::IsActiveThisFrame_Internal(const FSceneViewExtensionContext& Context) const
 {
-	return CVarEnable.GetValueOnAnyThread() != 0;
+	// Fully bypass (the SVE reports inactive, so no pass is ever scheduled) when the effect would be a
+	// no-op: disabled, zero strength, or an empty/inverted threshold window.
+	return CVarEnable.GetValueOnAnyThread() != 0
+		&& CVarStrength.GetValueOnAnyThread() > 0.0f
+		&& CVarThresholdMin.GetValueOnAnyThread() < CVarThresholdMax.GetValueOnAnyThread();
 }
 
 void FBitonicPixelSorterSceneViewExtension::SubscribeToPostProcessingPass(
@@ -51,7 +60,14 @@ void FBitonicPixelSorterSceneViewExtension::SubscribeToPostProcessingPass(
 	FPostProcessingPassDelegateArray& InOutPassCallbacks,
 	bool bIsPassEnabled)
 {
-	if (Pass == EPostProcessingPass::Tonemap && CVarEnable.GetValueOnRenderThread() != 0)
+	// Same bypass as IsActiveThisFrame_Internal: only subscribe the callback when the effect will
+	// actually do something. Zero strength or an empty threshold window means no pass at all.
+	const bool bEffectActive =
+		CVarEnable.GetValueOnRenderThread() != 0
+		&& CVarStrength.GetValueOnRenderThread() > 0.0f
+		&& CVarThresholdMin.GetValueOnRenderThread() < CVarThresholdMax.GetValueOnRenderThread();
+
+	if (Pass == EPostProcessingPass::Tonemap && bEffectActive)
 	{
 		InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(
 			this, &FBitonicPixelSorterSceneViewExtension::PostProcessPass_RenderThread));
@@ -77,6 +93,7 @@ FScreenPassTexture FBitonicPixelSorterSceneViewExtension::PostProcessPass_Render
 	Params.bAscending  = CVarAscending.GetValueOnRenderThread() != 0;
 	Params.ThresholdMin = CVarThresholdMin.GetValueOnRenderThread();
 	Params.ThresholdMax = CVarThresholdMax.GetValueOnRenderThread();
+	Params.Strength = CVarStrength.GetValueOnRenderThread();
 
 	FRDGTextureRef Sorted = AddBitonicPixelSortPasses(
 		GraphBuilder, View.GetFeatureLevel(), SceneColor.Texture, SceneColor.ViewRect, Params);

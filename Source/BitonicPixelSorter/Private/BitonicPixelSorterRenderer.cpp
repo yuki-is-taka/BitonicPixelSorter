@@ -51,6 +51,7 @@ class FSortPassCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, sortTex)
 		SHADER_PARAMETER(int32, maxLevels)
 		SHADER_PARAMETER(uint32, ordering)
+		SHADER_PARAMETER(float, strength)
 		SHADER_PARAMETER(uint32, direction)
 		SHADER_PARAMETER(FUintVector2, viewportMin)
 		SHADER_PARAMETER(FUintVector2, viewportSize)
@@ -113,7 +114,8 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 	const uint32 NumLines = (uint32)(LineMax - LineMin + 1);
 
 	// Algorithm sorts an entire line in group-shared memory; bail if it can't fit.
-	if (SortAxis == 0 || NumLines == 0 || SortAxis >= kMaxSize)
+	if (SortAxis == 0 || NumLines == 0 || SortAxis >= kMaxSize
+		|| Params.Strength <= 0.0f || Params.ThresholdMin >= Params.ThresholdMax)
 	{
 		return SrcTexture;
 	}
@@ -160,6 +162,7 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 		P->sortTex = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(SortTexture));
 		P->maxLevels = FMath::CeilToInt(FMath::Log2((float)SortAxis));
 		P->ordering = Params.bAscending ? 1u : 0u;
+		P->strength = Params.Strength;
 		P->direction = DirectionFlag;
 		P->viewportMin = ViewMin;
 		P->viewportSize = FUintVector2(W, H);

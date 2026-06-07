@@ -205,6 +205,7 @@ Texture2D<uint2> srcMetaTex;
 RWTexture2D<float4> sortTex;
 int maxLevels;
 uint ordering; // bool
+float strength; // 0..1 cross-fade: lerp(original, sorted, strength)
 
 groupshared uint groupCache[MAX_SIZE];
 
@@ -332,11 +333,11 @@ void SortPass(uint3 gid_l : SV_GroupID,
         // outside is left as the pristine original (it is never written here).
         if (inA && xL < (int)size)
         {
-            sortTex[pos_a + viewportMin] = srcTex[pos_left + viewportMin];
+            sortTex[pos_a + viewportMin] = lerp(srcTex[pos_a + viewportMin], srcTex[pos_left + viewportMin], strength);
         }
         if (inB && xR < (int)size)
         {
-            sortTex[pos_b + viewportMin] = srcTex[pos_right + viewportMin];
+            sortTex[pos_b + viewportMin] = lerp(srcTex[pos_b + viewportMin], srcTex[pos_right + viewportMin], strength);
         }
     }
 }

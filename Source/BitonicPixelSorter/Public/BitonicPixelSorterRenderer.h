@@ -20,6 +20,9 @@ struct FBitonicPixelSorterParams
 	/** Pixels are sorted only where brightness is within [ThresholdMin, ThresholdMax]. */
 	float ThresholdMin = 0.4f;
 	float ThresholdMax = 0.6f;
+
+	/** Effect strength 0..1: cross-fade between the original (0) and fully sorted (1) image. */
+	float Strength = 1.0f;
 };
 
 /**
