@@ -1,0 +1,12 @@
+# Unreal Engine plugin build artifacts
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+
+# OS / editor cruft
+.DS_Store
+*.VC.db
+*.opensdf
+*.sdf
+*.suo

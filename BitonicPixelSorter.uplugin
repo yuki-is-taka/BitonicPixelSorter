@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Bitonic Pixel Sorter",
+	"Description": "Realtime GPU pixel-sort post-process effect (bitonic sort). Unreal Engine port of ruccho/BitonicPixelSorter (MIT).",
+	"Category": "Rendering",
+	"CreatedBy": "yuki-is-taka (UE port); original by ruccho",
+	"CreatedByURL": "https://github.com/yuki-is-taka/BitonicPixelSorter",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/yuki-is-taka/BitonicPixelSorter/issues",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "BitonicPixelSorter",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

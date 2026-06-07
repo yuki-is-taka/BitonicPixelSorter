@@ -1,0 +1,12 @@
+// BitonicPixelSorter.usf
+// Unreal Engine port of ruccho/BitonicPixelSorter (MIT, Copyright (c) 2020 ruccho).
+//
+// Placeholder. The MetaPass / SortPass compute kernels (bitonic sort over per-line
+// brightness ranges) will be ported here from the original BitonicPixelSorter.compute,
+// adapted to UE HLSL (RDG global shaders) and extended with arbitrary-rotation support.
+//
+// Kept free of platform-specific intrinsics so it cross-compiles to DXIL / SPIR-V / Metal.
+
+#include "/Engine/Public/Platform.ush"
+
+// (Kernels to be added.)
