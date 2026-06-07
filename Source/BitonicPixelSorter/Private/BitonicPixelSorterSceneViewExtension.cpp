@@ -81,6 +81,17 @@ FScreenPassTexture FBitonicPixelSorterSceneViewExtension::PostProcessPass_Render
 	FRDGTextureRef Sorted = AddBitonicPixelSortPasses(
 		GraphBuilder, View.GetFeatureLevel(), SceneColor.Texture, SceneColor.ViewRect, Params);
 
-	// TODO: honor Inputs.OverrideOutput when this is the final back-buffer pass.
-	return FScreenPassTexture(Sorted, SceneColor.ViewRect);
+	const FScreenPassTexture SortedOutput(Sorted, SceneColor.ViewRect);
+
+	// When the post-process chain provides a target to render into (typically when this is the final
+	// pass before the back buffer), copy the sorted result there and return it; otherwise return our
+	// own texture and let the next pass consume it.
+	FScreenPassRenderTarget OverrideOutput = Inputs.OverrideOutput;
+	if (OverrideOutput.IsValid())
+	{
+		AddDrawTexturePass(GraphBuilder, View, SortedOutput, OverrideOutput);
+		return MoveTemp(OverrideOutput);
+	}
+
+	return SortedOutput;
 }
