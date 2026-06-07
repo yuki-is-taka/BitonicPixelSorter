@@ -20,6 +20,8 @@ yuki-is-taka. MIT licensed (see `LICENSE`).
 - Two ways to drive it: a **Post Process Volume** (artist / Blueprint / Sequencer friendly) or
   **console variables** (quick global control / tuning).
 - **Firm bypass** — when the effect would do nothing, no GPU pass is scheduled at all.
+- **No hard resolution cap** — large views (sorted axis ≥ 2048 px) use a seamless global-memory path
+  bounded only by VRAM, so 4K / 8K and beyond work (see *Notes & limitations*).
 
 ## Requirements
 
@@ -81,6 +83,7 @@ r.BitonicPixelSorter.Ascending 1
 | Threshold Max | `r.BitonicPixelSorter.ThresholdMax` | `ThresholdMax` | `0.6` | `0..1` | Only pixels with brightness ≤ this are sorted. |
 | Strength | `r.BitonicPixelSorter.Strength` | `Strength` | `1` | `0..1` | Cross-fade between the original (0) and the fully sorted (1) image. |
 | Ascending | `r.BitonicPixelSorter.Ascending` | `bAscending` | `1` | 0 / 1 | Sort order: 1 = dark→bright along the line, 0 = reversed. |
+| Max scratch | `r.BitonicPixelSorter.MaxScratchMB` | — | `1536` | MB, `0` = ∞ | Wide-path (sorted axis ≥ 2048) VRAM budget; a view needing more scratch is skipped. |
 
 **The threshold window is the "amount" control:** a narrow `[Min, Max]` sorts fewer pixels (subtle);
 `Min 0 / Max 1` sorts everything (strongest, and heaviest). Position the window to sort only
@@ -98,13 +101,22 @@ highlights (e.g. `0.6 .. 0.9`) or only shadows (e.g. `0.05 .. 0.35`).
   round(f)` for integer `n`, this is an exact tiling of the pixel grid — a true permutation.
 - The passes are confined to the view's `ViewRect` (scene-color render targets are often padded
   larger; their padding texels are uninitialized).
+- **Large views** (sorted axis ≥ 2048 px) keep the exact same algorithm and result, but move the
+  per-line working set out of group-shared memory into global scratch buffers, synchronized with
+  device-memory barriers between bitonic levels. The line is never split into tiles, so the output
+  is identical and seamless; the only added bound is scratch VRAM.
 
 ## Notes & limitations
 
-- **Sort axis < 2048 px.** A line is sorted entirely in group-shared memory, so the sorted axis
-  (the view width for near-horizontal angles, the height for near-vertical) must be under 2048.
-  Above that the effect is skipped for that view. Note this is the view's width/height, **not** the
-  diagonal, even at an angle.
+- **No hard resolution cap; sorted axis ≥ 2048 px is heavier.** Below 2048 px the sorted axis
+  (the view width for near-horizontal angles, the height for near-vertical — **not** the diagonal,
+  even at an angle) uses the fast group-shared path. At or above 2048 it automatically switches to
+  the global-memory "wide" path described in *How it works* — still one seamless sort per whole line,
+  bounded only by scratch VRAM rather than a fixed pixel cap. A view whose predicted scratch
+  (≈ `10 × lines × axis` bytes; roughly 0.1–0.2 GB at 4K, 0.3–0.8 GB at 8K, 1–3 GB at 16K) exceeds
+  `r.BitonicPixelSorter.MaxScratchMB` (default `1536`, `0` = unlimited) is skipped untouched — raise
+  it for very large LED-wall resolutions. The wide path is more bandwidth-heavy, so it suits
+  moments/transitions rather than always-on at extreme resolutions.
 - **Edges are stair-stepped at non-axis angles.** Because pixels are kept exact (no anti-aliasing),
   diagonal sort streaks have a digital-line staircase. That is the cost of preserving pixel quality;
   smoothing them would require blending (blur).

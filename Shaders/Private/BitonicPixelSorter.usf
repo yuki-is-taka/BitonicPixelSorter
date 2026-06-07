@@ -25,6 +25,23 @@
 #define META_LINES_PER_GROUP 8
 #define META_THREADS_PER_GROUP (META_LINES_PER_GROUP * 2)
 
+// WIDE_LINE permutation: 0 = original group-shared path (sort axis < 2048); 1 = "wide" path that
+// keeps the per-line working set in global scratch buffers, lifting the 2048 group-shared limit so
+// the sort axis is bounded only by scratch VRAM. Set by the C++ shader permutation (FWideLine).
+#ifndef WIDE_LINE
+#define WIDE_LINE 0
+#endif
+
+// Span endpoints stored in metaTex: 12 bits each on the fast path (positions < 2048), widened to
+// 16 bits on the wide path so positions up to 65535 round-trip without truncation.
+#if WIDE_LINE
+#define META_POS_BITS 16
+#define META_POS_MASK 0xFFFFu
+#else
+#define META_POS_BITS 12
+#define META_POS_MASK 0x0FFFu
+#endif
+
 float brightness(float4 col)
 {
     return saturate(0.298912 * col.r + 0.586611 * col.g + 0.114478 * col.b);
@@ -83,7 +100,13 @@ uint2 lineTexel(int lineIdx, int coord, out bool bInside)
 }
 
 // ============================ MetaPass ============================
+#if WIDE_LINE
+// Inter-half cache in global memory (one row per line): packs range flags + 8-bit brightnesses in
+// .x and the full (untruncated) range start in .y, indexed [lineIdx * cacheLineSize + xMeta].
+RWStructuredBuffer<uint2> metaScratch;
+#else
 groupshared uint metaGroupCache[MAX_SIZE * 4];
+#endif
 
 [numthreads(META_THREADS_PER_GROUP,1,1)]
 void MetaPass(uint3 groupId : SV_GroupID,
@@ -139,20 +162,29 @@ void MetaPass(uint3 groupId : SV_GroupID,
 
             int rangeStartAny = rangeFirst ? rangeStartFirst : rangeStart;
 
-            uint cachePos = groupLocalY * cacheLineSize + xMeta;
             bool rangeLeft = metaDirection ? rangeFirst : rangeSecond;
             bool rangeRight = metaDirection ? rangeSecond : rangeFirst;
 
             uint bLeft = metaDirection ? bFirst * 255 : bSecond * 255;
             uint bRight = metaDirection ? bSecond * 255 : bFirst * 255;
 
+#if WIDE_LINE
+            uint flagsCache = (rangeLeft ? 0x80000000u : 0u) | (rangeRight ? 0x40000000u : 0u)
+                            | ((bLeft & 0xFFu) << 8) | (bRight & 0xFFu);
+            metaScratch[y * cacheLineSize + xMeta] = uint2(flagsCache, (uint)rangeStartAny);
+#else
+            uint cachePos = groupLocalY * cacheLineSize + xMeta;
             uint packedCache = packMetaGroupCache(rangeLeft, rangeRight, rangeStartAny, bLeft, bRight);
-
             metaGroupCache[cachePos] = packedCache;
+#endif
         }
     }
 
+#if WIDE_LINE
+    DeviceMemoryBarrierWithGroupSync();
+#else
     GroupMemoryBarrierWithGroupSync();
+#endif
 
     {
         for (uint p = firstHalfSize; p < size; p += 2)
@@ -165,16 +197,23 @@ void MetaPass(uint3 groupId : SV_GroupID,
             uint xFirst = metaDirection ? xL : xR;
             uint xSecond = metaDirection ? xR : xL;
 
-            uint cachePos = groupLocalY * cacheLineSize + xMeta;
-            uint packed = metaGroupCache[cachePos];
-
             bool rangeLeft;
             bool rangeRight;
             int otherStart;
             int bFirst;
             int bSecond;
-
+#if WIDE_LINE
+            uint2 mv = metaScratch[y * cacheLineSize + xMeta];
+            rangeLeft = (mv.x & 0x80000000u) != 0;
+            rangeRight = (mv.x & 0x40000000u) != 0;
+            otherStart = (int)mv.y;
+            bFirst = (int)((mv.x >> 8) & 0xFFu);
+            bSecond = (int)(mv.x & 0xFFu);
+#else
+            uint cachePos = groupLocalY * cacheLineSize + xMeta;
+            uint packed = metaGroupCache[cachePos];
             unpackMetaGroupCache(packed, rangeLeft, rangeRight, otherStart, bFirst, bSecond);
+#endif
 
             bool rangeFirst = metaDirection ? rangeLeft : rangeRight;
             bool rangeSecond = metaDirection ? rangeRight : rangeLeft;
@@ -194,7 +233,7 @@ void MetaPass(uint3 groupId : SV_GroupID,
 
             // metaTex is our own intermediate, keyed by (position/2 along the line, line index).
             // B8L12R12
-            metaTex[uint2(xMeta, y)] = uint2(((uint)startL & 0x0FFF) << 12 | (uint)startR & 0x0FFF,
+            metaTex[uint2(xMeta, y)] = uint2(((uint)startL & META_POS_MASK) << META_POS_BITS | ((uint)startR & META_POS_MASK),
                                              ((f32tof16(bFirst) & 0xFFFF) << 16) | (f32tof16(bSecond) & 0xFFFF));
         }
     }
@@ -207,7 +246,20 @@ int maxLevels;
 uint ordering; // bool
 float strength; // 0..1 cross-fade: lerp(original, sorted, strength)
 
+#if WIDE_LINE
+// Wide path: the per-line working set lives in global scratch (one line per thread group, sorted in
+// place with device-memory barriers between bitonic levels). This lifts the group-shared 2048 limit;
+// the only remaining bound is scratch VRAM. lineScratch holds packed (index|brightness) per position;
+// rangeScratch holds the per-position span [start,end]. CACHE()/SYNC() select storage + barrier kind.
+RWStructuredBuffer<uint> lineScratch;  // [gid * lineStride + pos]
+RWStructuredBuffer<uint> rangeScratch; // [gid * reducedSize + xMeta]
+#define CACHE(i) lineScratch[gid * lineStride + (i)]
+#define SYNC()   DeviceMemoryBarrierWithGroupSync()
+#else
 groupshared uint groupCache[MAX_SIZE];
+#define CACHE(i) groupCache[i]
+#define SYNC()   GroupMemoryBarrierWithGroupSync()
+#endif
 
 [numthreads(MAX_THREADS,1,1)]
 void SortPass(uint3 gid_l : SV_GroupID,
@@ -217,31 +269,37 @@ void SortPass(uint3 gid_l : SV_GroupID,
     int gtid = gtid_l.x;
     int ops;
     uint size;
+    uint reducedSize;
     {
         uint width = viewportSize.x;
         uint height = viewportSize.y;
 
         size = direction ? width : height; // line length along the major axis
-        uint reducedSize = ceil((float)size / 2);
+        reducedSize = ceil((float)size / 2);
 
         ops = ceil((float)reducedSize / MAX_THREADS);
     }
+    uint lineStride = reducedSize * 2; // even; keeps a line's xL/xR writes inside its own region (wide)
 
+#if !WIDE_LINE
     uint preMeta[MAX_OPS];
+#endif
 
     {
         for (int t = 0; t < ops; t++)
         {
             int xMeta = (MAX_THREADS * t + gtid);
-
+#if WIDE_LINE
+            if (xMeta >= (int)reducedSize) continue; // global path has no shared-cache slack
+#endif
             int xL = xMeta * 2;
             int xR = xL + 1;
 
             //get meta (keyed by position/2 along the line, line index)
             uint2 meta = srcMetaTex[uint2(xMeta, gid)];
             uint meta0 = meta.x;
-            int startL = (meta0 >> 12) & 0x0FFF;
-            int startR = meta0 & 0x0FFF;
+            int startL = (meta0 >> META_POS_BITS) & META_POS_MASK;
+            int startR = meta0 & META_POS_MASK;
             bool useR = (startL & 1) > 0;
 
             int x = useR ? xR : xL;
@@ -251,11 +309,16 @@ void SortPass(uint3 gid_l : SV_GroupID,
             startL = isInRange ? startL : x;
             startR = isInRange ? startR : x;
 
-            preMeta[t] = ((uint)startL << 16) | startR;
+            uint packedSpan = ((uint)startL << 16) | startR;
+#if WIDE_LINE
+            rangeScratch[gid * reducedSize + xMeta] = packedSpan;
+#else
+            preMeta[t] = packedSpan;
+#endif
 
             // high 16bit for index, low 16bit for brightness
-            groupCache[xL] = (meta.y >> 16) | ((uint)xL << 16);
-            groupCache[xR] = (meta.y & 0xFFFF) | ((uint)xR << 16);
+            CACHE(xL) = (meta.y >> 16) | ((uint)xL << 16);
+            CACHE(xR) = (meta.y & 0xFFFF) | ((uint)xR << 16);
         }
     }
 
@@ -263,15 +326,21 @@ void SortPass(uint3 gid_l : SV_GroupID,
     {
         for (phase = (phase << 16) + (phase & 0xFFFF); (uint)(phase >> 16) <= 0x7FFF; phase -= (1 << 16))
         {
-            GroupMemoryBarrierWithGroupSync();
+            SYNC();
 
             for (int t = 0; t < ops; t++)
             {
+                int xMeta = MAX_THREADS * t + gtid;
+#if WIDE_LINE
+                if (xMeta >= (int)reducedSize) continue;
+                uint metaPacked = rangeScratch[gid * reducedSize + xMeta];
+#else
                 uint metaPacked = preMeta[t];
+#endif
                 int rangeStart = metaPacked >> 16;
                 int rangeEnd = metaPacked & 0xFFFF;
 
-                int x = (MAX_THREADS * t + gtid) << 1;
+                int x = xMeta << 1;
 
                 int useR = rangeStart & 1;
                 int posInRange = x - rangeStart + useR;
@@ -290,8 +359,8 @@ void SortPass(uint3 gid_l : SV_GroupID,
                 bool ascPattern = ((endBlock & 1) == 0) == (ordering != 0);
                 bool asc = ((block & 1) == 0) == ascPattern;
 
-                uint val_a = groupCache[a];
-                uint val_b = groupCache[b];
+                uint val_a = CACHE(a);
+                uint val_b = CACHE(b);
 
                 float br_a = f16tof32(val_a & 0xFFFF);
                 float br_b = f16tof32(val_b & 0xFFFF);
@@ -301,21 +370,26 @@ void SortPass(uint3 gid_l : SV_GroupID,
                 uint left = asc == comp ? val_a : val_b;
                 uint right = asc == comp ? val_b : val_a;
 
-                groupCache[a] = left;
-                groupCache[b] = right;
+                CACHE(a) = left;
+                CACHE(b) = right;
             }
         }
     }
 
+#if WIDE_LINE
+    SYNC(); // make the last bitonic level's writes visible to the gather (other threads' slots)
+#endif
     for (int t = 0; t < ops; t++)
     {
         int xMeta = (MAX_THREADS * t + gtid);
-
+#if WIDE_LINE
+        if (xMeta >= (int)reducedSize) continue;
+#endif
         int xL = xMeta * 2;
         int xR = xL + 1;
 
-        uint val_a = groupCache[xL];
-        uint val_b = groupCache[xR];
+        uint val_a = CACHE(xL);
+        uint val_b = CACHE(xR);
 
         // Clamp gather indices into the valid line range [0, size). A stale index from an
         // uninitialized groupCache slot can appear at a sort-range edge; clamping keeps the read

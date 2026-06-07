@@ -7,17 +7,30 @@
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "DataDrivenShaderPlatformInfo.h"
+#include "HAL/IConsoleManager.h"
 
 // META_THREADS_PER_GROUP in the .usf (META_LINES_PER_GROUP(8) * 2).
 static constexpr uint32 kMetaThreadsPerGroup = 16;
-// Sorted axis must be smaller than this (group-shared-memory limit, MAX_SIZE in the .usf).
-static constexpr uint32 kMaxSize = 2048;
+// Sorted axis below this uses the original single-group, group-shared path (MAX_SIZE in the .usf).
+// At or above it, the "wide" path moves the per-line working set into global scratch buffers so the
+// sort axis is bounded only by scratch VRAM (see CVarMaxScratchMB) instead of by 2048.
+static constexpr uint32 kFastMax = 2048;
+
+// VRAM budget (MB) for the wide path's transient scratch (~10 * NumLines * SortAxis bytes). A view
+// that would need more than this is left untouched. 0 = unlimited.
+static TAutoConsoleVariable<int32> CVarMaxScratchMB(
+	TEXT("r.BitonicPixelSorter.MaxScratchMB"), 1536,
+	TEXT("Bitonic pixel sorter: VRAM budget (MB) for the wide >2048 sort-axis path. Views needing more scratch are skipped. 0 = unlimited."),
+	ECVF_RenderThreadSafe);
 
 // ---- MetaPass: marks per-line brightness ranges to be sorted, into metaTex ----
 class FMetaPassCS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FMetaPassCS);
 	SHADER_USE_PARAMETER_STRUCT(FMetaPassCS, FGlobalShader);
+
+	class FWideLine : SHADER_PERMUTATION_BOOL("WIDE_LINE");
+	using FPermutationDomain = TShaderPermutationDomain<FWideLine>;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, srcTex)
@@ -29,6 +42,8 @@ class FMetaPassCS : public FGlobalShader
 		SHADER_PARAMETER(FUintVector2, viewportSize)
 		SHADER_PARAMETER(float, slope)
 		SHADER_PARAMETER(int32, lineOffset)
+		// Wide path only (null on the fast path): global inter-half cache, one uint2 per meta texel.
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FUintVector2>, metaScratch)
 	END_SHADER_PARAMETER_STRUCT()
 
 public:
@@ -45,6 +60,9 @@ class FSortPassCS : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FSortPassCS);
 	SHADER_USE_PARAMETER_STRUCT(FSortPassCS, FGlobalShader);
 
+	class FWideLine : SHADER_PERMUTATION_BOOL("WIDE_LINE");
+	using FPermutationDomain = TShaderPermutationDomain<FWideLine>;
+
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, srcTex)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint2>, srcMetaTex)
@@ -57,6 +75,9 @@ class FSortPassCS : public FGlobalShader
 		SHADER_PARAMETER(FUintVector2, viewportSize)
 		SHADER_PARAMETER(float, slope)
 		SHADER_PARAMETER(int32, lineOffset)
+		// Wide path only (null on the fast path): global per-line working set + per-position spans.
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, lineScratch)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, rangeScratch)
 	END_SHADER_PARAMETER_STRUCT()
 
 public:
@@ -113,15 +134,36 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 	const int32 LineOffset = LineMin;
 	const uint32 NumLines = (uint32)(LineMax - LineMin + 1);
 
-	// Algorithm sorts an entire line in group-shared memory; bail if it can't fit.
-	if (SortAxis == 0 || NumLines == 0 || SortAxis >= kMaxSize
+	// Bail when there is nothing to do (degenerate size, no strength, or an empty threshold window).
+	if (SortAxis == 0 || NumLines == 0
 		|| Params.Strength <= 0.0f || Params.ThresholdMin >= Params.ThresholdMax)
 	{
 		return SrcTexture;
 	}
 
+	// Below kFastMax: original single-group, group-shared path (bit-for-bit unchanged). At/above it,
+	// the "wide" path keeps the per-line working set in global scratch and synchronizes the bitonic
+	// levels with device-memory barriers, so the sort axis is bounded only by scratch VRAM.
+	const bool bWide = SortAxis >= kFastMax;
+
+	const uint32 ReducedSize = FMath::DivideAndRoundUp(SortAxis, 2u); // meta texels per line
+	const uint32 LineStride = ReducedSize * 2u;                       // even; contains a line's xL/xR
+
+	if (bWide)
+	{
+		// Predicted transient scratch: lineScratch (NumLines*LineStride*4) + rangeScratch
+		// (NumLines*ReducedSize*4) + metaScratch (NumLines*ReducedSize*8) ~= 10 * NumLines * SortAxis.
+		const uint64 ScratchBytes =
+			(uint64)NumLines * ((uint64)LineStride + 3ull * (uint64)ReducedSize) * sizeof(uint32);
+		const int32 BudgetMB = CVarMaxScratchMB.GetValueOnRenderThread();
+		if (BudgetMB > 0 && ScratchBytes > (uint64)BudgetMB * 1024ull * 1024ull)
+		{
+			return SrcTexture; // larger than the configured budget; leave the view untouched
+		}
+	}
+
 	// metaTex is our own intermediate, keyed by (position/2 along the line, line index).
-	const FIntPoint MetaExtent(FMath::DivideAndRoundUp(SortAxis, 2u), NumLines);
+	const FIntPoint MetaExtent((int32)ReducedSize, (int32)NumLines);
 
 	FRDGTextureRef MetaTexture = GraphBuilder.CreateTexture(
 		FRDGTextureDesc::Create2D(MetaExtent, PF_R32G32_UINT, FClearValueBinding::None,
@@ -132,6 +174,26 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 		FRDGTextureDesc::Create2D(Extent, SrcTexture->Desc.Format, FClearValueBinding::None,
 			TexCreate_UAV | TexCreate_ShaderResource | TexCreate_RenderTargetable),
 		TEXT("BitonicPixelSorter.Sorted"));
+
+	// Wide-path global scratch (one region per line); left null on the fast path.
+	FRDGBufferRef MetaScratch = nullptr;
+	FRDGBufferRef LineScratch = nullptr;
+	FRDGBufferRef RangeScratch = nullptr;
+	if (bWide)
+	{
+		// metaScratch gets a few pad rows so MetaPass's excess threads (2 per line, rounded up to the
+		// group size) never write out of bounds; SortPass dispatches exactly NumLines groups.
+		const uint32 MetaRows = NumLines + 8u;
+		MetaScratch = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector2), MetaRows * ReducedSize),
+			TEXT("BitonicPixelSorter.MetaScratch"));
+		LineScratch = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), NumLines * LineStride),
+			TEXT("BitonicPixelSorter.LineScratch"));
+		RangeScratch = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), NumLines * ReducedSize),
+			TEXT("BitonicPixelSorter.RangeScratch"));
+	}
 
 	FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(FeatureLevel);
 
@@ -147,8 +209,14 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 		P->viewportSize = FUintVector2(W, H);
 		P->slope = Slope;
 		P->lineOffset = LineOffset;
+		if (bWide)
+		{
+			P->metaScratch = GraphBuilder.CreateUAV(MetaScratch);
+		}
 
-		TShaderMapRef<FMetaPassCS> ComputeShader(ShaderMap);
+		FMetaPassCS::FPermutationDomain Perm;
+		Perm.Set<FMetaPassCS::FWideLine>(bWide);
+		TShaderMapRef<FMetaPassCS> ComputeShader(ShaderMap, Perm);
 		const uint32 Groups = FMath::DivideAndRoundUp(NumLines * 2, kMetaThreadsPerGroup);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("BitonicPixelSorter.Meta"),
 			ComputeShader, P, FIntVector(Groups, 1, 1));
@@ -168,8 +236,15 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 		P->viewportSize = FUintVector2(W, H);
 		P->slope = Slope;
 		P->lineOffset = LineOffset;
+		if (bWide)
+		{
+			P->lineScratch = GraphBuilder.CreateUAV(LineScratch);
+			P->rangeScratch = GraphBuilder.CreateUAV(RangeScratch);
+		}
 
-		TShaderMapRef<FSortPassCS> ComputeShader(ShaderMap);
+		FSortPassCS::FPermutationDomain Perm;
+		Perm.Set<FSortPassCS::FWideLine>(bWide);
+		TShaderMapRef<FSortPassCS> ComputeShader(ShaderMap, Perm);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("BitonicPixelSorter.Sort"),
 			ComputeShader, P, FIntVector(NumLines, 1, 1));
 	}
