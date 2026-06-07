@@ -11,12 +11,14 @@ yuki-is-taka. MIT licensed (see `LICENSE`).
 
 ## Features
 
-- Realtime per-pixel **brightness sort** as a scene post-process (no render-target plumbing needed).
+- Realtime per-pixel **value sort** as a scene post-process (no render-target plumbing needed).
+- **Selectable sort key** — order by **luma, hue, saturation, value, or a single R/G/B channel**.
+  The same key drives the threshold, so e.g. picking *Hue* selects a colour range and sorts it by hue.
 - **Arbitrary angle** — sort along any direction, not just horizontal/vertical. The sort is an
   **exact permutation** of the original pixels (no resampling), so the source image quality is
   preserved; only which pixels move changes.
 - **Strength** cross-fade (0..1) to dial the effect in and out.
-- **Brightness threshold window** to choose which pixels participate.
+- **Threshold window** (on the selected key) to choose which pixels participate.
 - Two ways to drive it: a **Post Process Volume** (artist / Blueprint / Sequencer friendly) or
   **console variables** (quick global control / tuning).
 - **Firm bypass** — when the effect would do nothing, no GPU pass is scheduled at all.
@@ -67,6 +69,7 @@ view. Type them in the editor console (`` ` `` / `~`):
 ```
 r.BitonicPixelSorter.Enable 1
 r.BitonicPixelSorter.Angle 45
+r.BitonicPixelSorter.SortKey 0
 r.BitonicPixelSorter.ThresholdMin 0
 r.BitonicPixelSorter.ThresholdMax 1
 r.BitonicPixelSorter.Strength 1
@@ -79,6 +82,7 @@ r.BitonicPixelSorter.Ascending 1
 |---|---|---|---|---|---|
 | Enable | `r.BitonicPixelSorter.Enable` | (presence of the volume) | `0` | 0 / 1 | Turn the effect on (CVar path only). |
 | Angle | `r.BitonicPixelSorter.Angle` | `Angle` | `0` | `[0, 180)` deg | Sort direction. **0 = horizontal**, **90 = vertical**, **45 = diagonal**. |
+| Sort key | `r.BitonicPixelSorter.SortKey` | `SortKey` | `0` (Luma) | 0..6 | Pixel value the threshold + sort use: 0 Luma, 1 Hue, 2 Saturation, 3 Value, 4 R, 5 G, 6 B. |
 | Threshold Min | `r.BitonicPixelSorter.ThresholdMin` | `ThresholdMin` | `0.4` | `0..1` | Only pixels with brightness ≥ this are sorted. |
 | Threshold Max | `r.BitonicPixelSorter.ThresholdMax` | `ThresholdMax` | `0.6` | `0..1` | Only pixels with brightness ≤ this are sorted. |
 | Strength | `r.BitonicPixelSorter.Strength` | `Strength` | `1` | `0..1` | Cross-fade between the original (0) and the fully sorted (1) image. |

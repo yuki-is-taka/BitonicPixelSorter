@@ -41,6 +41,11 @@ static TAutoConsoleVariable<float> CVarStrength(
 	TEXT("Effect strength 0..1: cross-fade between the original (0) and fully sorted (1) image. <=0 bypasses."),
 	ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<int32> CVarSortKey(
+	TEXT("r.BitonicPixelSorter.SortKey"), 0,
+	TEXT("Pixel value to threshold on and sort by: 0=Luma 1=Hue 2=Saturation 3=Value 4=Red 5=Green 6=Blue."),
+	ECVF_RenderThreadSafe);
+
 // Returns the per-view blended sorter settings if a Post Process Volume / camera / component is
 // driving this view, or nullptr to fall back to the CVars.
 static const FBitonicPixelSorterBlendData* FindBlendable(const FSceneView& View)
@@ -120,6 +125,7 @@ FScreenPassTexture FBitonicPixelSorterSceneViewExtension::PostProcessPass_Render
 		Params.ThresholdMin = Blend->ThresholdMin;
 		Params.ThresholdMax = Blend->ThresholdMax;
 		Params.Strength = Blend->Strength;
+		Params.SortKey = Blend->SortKey;
 	}
 	else
 	{
@@ -128,6 +134,7 @@ FScreenPassTexture FBitonicPixelSorterSceneViewExtension::PostProcessPass_Render
 		Params.ThresholdMin = CVarThresholdMin.GetValueOnRenderThread();
 		Params.ThresholdMax = CVarThresholdMax.GetValueOnRenderThread();
 		Params.Strength = CVarStrength.GetValueOnRenderThread();
+		Params.SortKey = (uint8)FMath::Clamp(CVarSortKey.GetValueOnRenderThread(), 0, 6);
 	}
 
 	FRDGTextureRef Sorted = AddBitonicPixelSortPasses(

@@ -22,9 +22,10 @@ void UBitonicPixelSorterBlendable::OverrideBlendableSettings(FSceneView& View, f
 	Dest.ThresholdMax = FMath::Lerp(Dest.ThresholdMax, ThresholdMax, Weight);
 	Dest.Strength = FMath::Lerp(Dest.Strength, Strength, Weight);
 
-	// bAscending is discrete; take the dominant contributor.
+	// bAscending and SortKey are discrete; take the dominant contributor.
 	if (Weight >= 0.5f)
 	{
 		Dest.bAscending = bAscending ? 1 : 0;
+		Dest.SortKey = (uint8)SortKey;
 	}
 }

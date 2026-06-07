@@ -84,6 +84,35 @@ uint2 viewportMin;   // ViewRect.Min: texel offset of the view inside the (often
 uint2 viewportSize;  // ViewRect size: process only this region (texels outside are uninitialized)
 float slope;         // minor-axis step per major-axis step (tan or cot, in [-1,1]); 0 = axis-aligned
 int lineOffset;      // line intercept of lineIdx 0 (L = lineIdx + lineOffset)
+uint sortKey;        // 0=Luma 1=Hue 2=Saturation 3=Value(maxRGB) 4=R 5=G 6=B (threshold + sort key)
+
+// Sort/threshold key from a pixel, normalized to [0,1]. MetaPass uses this both to test the
+// threshold window and as the value SortPass orders by, so one selector drives both.
+float sortKeyValue(float4 col, uint key)
+{
+    float3 c = saturate(col.rgb);
+    if (key == 1u || key == 2u || key == 3u) // Hue / Saturation / Value share the min-max reduction
+    {
+        float mx = max(c.r, max(c.g, c.b));
+        float mn = min(c.r, min(c.g, c.b));
+        float d = mx - mn;
+        if (key == 3u) return mx;                      // Value
+        if (key == 2u) return mx > 0.0 ? d / mx : 0.0; // Saturation
+        float h = 0.0;                                 // Hue, normalized to [0,1)
+        if (d > 1e-6)
+        {
+            if (mx == c.r)      h = (c.g - c.b) / d + (c.g < c.b ? 6.0 : 0.0);
+            else if (mx == c.g) h = (c.b - c.r) / d + 2.0;
+            else                h = (c.r - c.g) / d + 4.0;
+            h /= 6.0;
+        }
+        return h;
+    }
+    if (key == 4u) return c.r;
+    if (key == 5u) return c.g;
+    if (key == 6u) return c.b;
+    return brightness(col); // 0 = Luma (default)
+}
 
 // Map (line index, position along the major axis) to a texel in the view.
 //   minor = round((lineIdx + lineOffset) + coord*slope)
@@ -146,10 +175,10 @@ void MetaPass(uint3 groupId : SV_GroupID,
             uint2 posFirst = lineTexel((int)y, (int)xFirst, inFirst);
             uint2 posSecond = lineTexel((int)y, (int)xSecond, inSecond);
 
-            float bFirst = brightness(srcTex[posFirst + viewportMin]);
+            float bFirst = sortKeyValue(srcTex[posFirst + viewportMin], sortKey);
             bool rangeFirst = xFirst < size && inFirst && thresholdMin <= bFirst && bFirst <= thresholdMax;
 
-            float bSecond = brightness(srcTex[posSecond + viewportMin]);
+            float bSecond = sortKeyValue(srcTex[posSecond + viewportMin], sortKey);
             bool rangeSecond = inSecond && thresholdMin <= bSecond && bSecond <= thresholdMax;
 
             int rangeStartFirst = metaDirection

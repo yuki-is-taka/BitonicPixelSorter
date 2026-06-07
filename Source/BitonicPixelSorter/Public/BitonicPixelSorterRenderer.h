@@ -23,6 +23,9 @@ struct FBitonicPixelSorterParams
 
 	/** Effect strength 0..1: cross-fade between the original (0) and fully sorted (1) image. */
 	float Strength = 1.0f;
+
+	/** Pixel value to threshold on and sort by: 0=Luma 1=Hue 2=Saturation 3=Value 4=R 5=G 6=B. */
+	uint8 SortKey = 0;
 };
 
 /**

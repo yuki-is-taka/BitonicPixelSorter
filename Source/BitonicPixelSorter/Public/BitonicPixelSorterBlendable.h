@@ -7,6 +7,19 @@
 #include "Engine/BlendableInterface.h"
 #include "BitonicPixelSorterBlendable.generated.h"
 
+/** Which pixel value the sorter thresholds on and orders by. */
+UENUM(BlueprintType)
+enum class EBitonicPixelSorterKey : uint8
+{
+	Luma        UMETA(DisplayName = "Luma"),
+	Hue         UMETA(DisplayName = "Hue"),
+	Saturation  UMETA(DisplayName = "Saturation"),
+	Value       UMETA(DisplayName = "Value (max RGB)"),
+	Red         UMETA(DisplayName = "Red"),
+	Green       UMETA(DisplayName = "Green"),
+	Blue        UMETA(DisplayName = "Blue"),
+};
+
 /**
  * Plain blended payload stored per view in FFinalPostProcessSettings::BlendableManager.
  * FBlendableManager requires GetFName() (type tag) and SetBaseValues() (blend starting point).
@@ -18,6 +31,7 @@ struct FBitonicPixelSorterBlendData
 	float ThresholdMax;
 	float Strength;
 	int32 bAscending;
+	uint8 SortKey;
 
 	/** Starting point when no blendable has contributed yet. Strength 0 so volume falloff fades in. */
 	void SetBaseValues()
@@ -27,6 +41,7 @@ struct FBitonicPixelSorterBlendData
 		ThresholdMax = 0.6f;
 		Strength = 0.0f;
 		bAscending = 1;
+		SortKey = 0;
 	}
 
 	/** Type tag for FBlendableManager type safety. */
@@ -75,6 +90,10 @@ public:
 	/** Sort order: true = ascending by brightness, false = descending. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bitonic Pixel Sorter")
 	bool bAscending = true;
+
+	/** Pixel value to threshold on and sort by (Luma, Hue, Saturation, Value, or a single channel). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Bitonic Pixel Sorter")
+	EBitonicPixelSorterKey SortKey = EBitonicPixelSorterKey::Luma;
 
 	//~ Begin IBlendableInterface
 	virtual void OverrideBlendableSettings(FSceneView& View, float Weight) const override;

@@ -42,6 +42,7 @@ class FMetaPassCS : public FGlobalShader
 		SHADER_PARAMETER(FUintVector2, viewportSize)
 		SHADER_PARAMETER(float, slope)
 		SHADER_PARAMETER(int32, lineOffset)
+		SHADER_PARAMETER(uint32, sortKey)
 		// Wide path only (null on the fast path): global inter-half cache, one uint2 per meta texel.
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FUintVector2>, metaScratch)
 	END_SHADER_PARAMETER_STRUCT()
@@ -209,6 +210,7 @@ FRDGTextureRef AddBitonicPixelSortPasses(
 		P->viewportSize = FUintVector2(W, H);
 		P->slope = Slope;
 		P->lineOffset = LineOffset;
+		P->sortKey = Params.SortKey;
 		if (bWide)
 		{
 			P->metaScratch = GraphBuilder.CreateUAV(MetaScratch);
