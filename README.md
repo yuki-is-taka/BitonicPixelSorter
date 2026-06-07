@@ -7,24 +7,116 @@ This is the `ue` branch — a clean, UE-only tree. The `master` branch tracks th
 project upstream for reference. Original algorithm and shaders © 2020 ruccho; UE port © 2026
 yuki-is-taka. MIT licensed (see `LICENSE`).
 
-## Status
+![status](https://img.shields.io/badge/status-working-brightgreen)
 
-Skeleton. Plugin module, shader directory mapping (`/Plugin/BitonicPixelSorter`), and a
-`SceneViewExtension` host are in place but inert. The compute kernels (MetaPass / SortPass) and
-the planned **arbitrary-rotation** feature are not yet ported.
+## Features
 
-## Design
+- Realtime per-pixel **brightness sort** as a scene post-process (no render-target plumbing needed).
+- **Arbitrary angle** — sort along any direction, not just horizontal/vertical. The sort is an
+  **exact permutation** of the original pixels (no resampling), so the source image quality is
+  preserved; only which pixels move changes.
+- **Strength** cross-fade (0..1) to dial the effect in and out.
+- **Brightness threshold window** to choose which pixels participate.
+- Two ways to drive it: a **Post Process Volume** (artist / Blueprint / Sequencer friendly) or
+  **console variables** (quick global control / tuning).
+- **Firm bypass** — when the effect would do nothing, no GPU pass is scheduled at all.
 
-- Effect runs as **RDG compute passes** injected via `ISceneViewExtension`
-  (`SubscribeToPostProcessingPass`, planned at `EPostProcessingPass::Tonemap`).
-- **Cross-platform by design**: targets Windows + macOS today, with headroom for further
-  platforms. No platform-specific module deps; shaders avoid platform-only intrinsics so they
-  cross-compile to DXIL / SPIR-V / Metal. (Metal path needs verification — not covered upstream.)
+## Requirements
+
+- Unreal Engine 5 (developed and tested on a **UE 5.8** source build; the module is not
+  version-pinned). Deferred renderer.
+- Verified on **macOS / Metal**. Windows / D3D12 should work (same RDG + cross-compiled HLSL) but
+  is currently untested.
+
+## Installation
+
+1. Copy or clone this repo into your project's `Plugins/` folder as
+   `Plugins/BitonicPixelSorter/` (use the `ue` branch).
+2. Regenerate project files and build (the plugin is a C++ Runtime module).
+3. Enable **Bitonic Pixel Sorter** in *Edit → Plugins* if it isn't already, and restart the editor.
+
+## Usage
+
+The effect is applied to the scene **after tone mapping** (and after any TSR/TAA/DLSS upscale),
+**before** UI — so HUD/widgets are never sorted. There are two ways to control it.
+
+### A) Post Process Volume (recommended)
+
+This is the idiomatic path: spatial blending, per-camera control, Blueprint, and **Sequencer
+keyframing** (most properties are `interp`).
+
+1. **Create the asset:** Content Browser → right-click → *Miscellaneous → Data Asset* → pick
+   **Bitonic Pixel Sorter Blendable**. Name it (e.g. `DA_BitonicSort`).
+2. **Add a Post Process Volume** to your level (or use a camera / `UPostProcessComponent`). For a
+   quick test, enable **Infinite Extent (Unbound)** so it affects every view.
+3. **Attach the blendable:** with the volume selected, go to *Details → Rendering Features →
+   Post Process Materials*, add an array entry, switch it to **Asset reference**, and select your
+   `DA_BitonicSort` asset.
+4. **Tune** the Data Asset's properties (below). Overlapping volumes blend by weight/falloff.
+
+When a volume's blendable affects a view, it **takes precedence** over the console variables.
+A ready-made sample asset is included at `Content/DA_BitonicPixelSorterBlendable.uasset`.
+
+### B) Console variables
+
+Useful for quick global tuning. These apply when **no** Post Process Volume blendable affects the
+view. Type them in the editor console (`` ` `` / `~`):
+
+```
+r.BitonicPixelSorter.Enable 1
+r.BitonicPixelSorter.Angle 45
+r.BitonicPixelSorter.ThresholdMin 0
+r.BitonicPixelSorter.ThresholdMax 1
+r.BitonicPixelSorter.Strength 1
+r.BitonicPixelSorter.Ascending 1
+```
+
+## Parameters
+
+| Parameter | CVar | Data Asset | Default | Range | Meaning |
+|---|---|---|---|---|---|
+| Enable | `r.BitonicPixelSorter.Enable` | (presence of the volume) | `0` | 0 / 1 | Turn the effect on (CVar path only). |
+| Angle | `r.BitonicPixelSorter.Angle` | `Angle` | `0` | `[0, 180)` deg | Sort direction. **0 = horizontal**, **90 = vertical**, **45 = diagonal**. |
+| Threshold Min | `r.BitonicPixelSorter.ThresholdMin` | `ThresholdMin` | `0.4` | `0..1` | Only pixels with brightness ≥ this are sorted. |
+| Threshold Max | `r.BitonicPixelSorter.ThresholdMax` | `ThresholdMax` | `0.6` | `0..1` | Only pixels with brightness ≤ this are sorted. |
+| Strength | `r.BitonicPixelSorter.Strength` | `Strength` | `1` | `0..1` | Cross-fade between the original (0) and the fully sorted (1) image. |
+| Ascending | `r.BitonicPixelSorter.Ascending` | `bAscending` | `1` | 0 / 1 | Sort order: 1 = dark→bright along the line, 0 = reversed. |
+
+**The threshold window is the "amount" control:** a narrow `[Min, Max]` sorts fewer pixels (subtle);
+`Min 0 / Max 1` sorts everything (strongest, and heaviest). Position the window to sort only
+highlights (e.g. `0.6 .. 0.9`) or only shadows (e.g. `0.05 .. 0.35`).
+
+## How it works
+
+- An `ISceneViewExtension` hooks `EPostProcessingPass::Tonemap` (after pass) and runs two **RDG
+  compute** passes: **MetaPass** marks the in-threshold spans per line; **SortPass** bitonic-sorts
+  them in group-shared memory and gathers the result.
+- The sort is index-based — each output pixel is an exact copy of an input pixel — so at full
+  strength there is **no blur**; untouched pixels are left exactly as they were.
+- **Arbitrary angle** is a shear parameterization: each sort line is the digital line
+  `pixel = (coord, round(L + coord·slope))` along the major axis. Because `round(n + f) == n +
+  round(f)` for integer `n`, this is an exact tiling of the pixel grid — a true permutation.
+- The passes are confined to the view's `ViewRect` (scene-color render targets are often padded
+  larger; their padding texels are uninitialized).
+
+## Notes & limitations
+
+- **Sort axis < 2048 px.** A line is sorted entirely in group-shared memory, so the sorted axis
+  (the view width for near-horizontal angles, the height for near-vertical) must be under 2048.
+  Above that the effect is skipped for that view. Note this is the view's width/height, **not** the
+  diagonal, even at an angle.
+- **Edges are stair-stepped at non-axis angles.** Because pixels are kept exact (no anti-aliasing),
+  diagonal sort streaks have a digital-line staircase. That is the cost of preserving pixel quality;
+  smoothing them would require blending (blur).
+- **Bypass:** no compute pass is scheduled at all when the effect is disabled, `Strength <= 0`, or
+  the threshold window is empty/inverted (`Min >= Max`).
 
 ## Layout
 
 ```
 BitonicPixelSorter.uplugin
-Source/BitonicPixelSorter/        Runtime module (SceneViewExtension host + module)
-Shaders/Private/                  Compute shaders (.usf)
+Source/BitonicPixelSorter/Public/    Renderer + Blendable (UBitonicPixelSorterBlendable) headers
+Source/BitonicPixelSorter/Private/   Module, SceneViewExtension, Renderer, Blendable
+Shaders/Private/                     BitonicPixelSorter.usf (MetaPass / SortPass)
+Content/                             Sample blendable Data Asset
 ```
