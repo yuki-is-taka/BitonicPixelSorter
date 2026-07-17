@@ -28,7 +28,7 @@ public:
 			AddShaderSourceDirectoryMapping(TEXT("/Plugin/BitonicPixelSorter"), ShaderDir);
 		}
 
-		PostEngineInitHandle = FCoreDelegates::OnPostEngineInit.AddLambda([this]()
+		PostEngineInitHandle = FCoreDelegates::GetOnPostEngineInit().AddLambda([this]()
 		{
 			ViewExtension = FSceneViewExtensions::NewExtension<FBitonicPixelSorterSceneViewExtension>();
 		});
@@ -36,7 +36,7 @@ public:
 
 	virtual void ShutdownModule() override
 	{
-		FCoreDelegates::OnPostEngineInit.Remove(PostEngineInitHandle);
+		FCoreDelegates::GetOnPostEngineInit().Remove(PostEngineInitHandle);
 		ViewExtension.Reset();
 	}
 
