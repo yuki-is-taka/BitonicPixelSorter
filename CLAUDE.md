@@ -2,7 +2,7 @@
 
 Realtime GPU pixel-sort post-process effect (bitonic sort), implemented as an `ISceneViewExtension` + RDG compute passes. UE port of ruccho/BitonicPixelSorter (Unity, MIT).
 
-Git-managed (independent repo), branch `ue` (the UE-only tree; `master` tracks the Unity upstream for reference). Use `git`, not `p4`. MIT licensed. Never commit without explicit user approval.
+Git-managed (independent repo), branch `ue` (the UE-only tree; `master` and `release` track the Unity upstream for reference). Use `git`, not `p4`. MIT licensed. Local commits on your own feature branch are allowed. Committing to or merging into `ue`, and every push, need explicit user approval each time (same policy as p4 submit). Landing procedure: root `CLAUDE.md`, "Landing a change".
 
 ## Notes
 - Single runtime module `BitonicPixelSorter`; hooks `EPostProcessingPass::Tonemap` (after tonemap, before UI).
